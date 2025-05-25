@@ -4,6 +4,7 @@ author: 'Rick Meneely <rick@devopspolis.com>'
 branding:
   icon: cloud-lighting
   color: purple
+  label: Deploy to Lambda
 
 inputs:
   function_name:
