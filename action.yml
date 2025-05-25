@@ -1,5 +1,5 @@
 name: 'Deploy to AWS Lambda'
-description: 'Deploys a zip file, GitHub artifact, or container image to AWS Lambda, with optional config, env, rollback, and layers support.'
+description: 'Deploys a zip file, artifact, or container image to AWS Lambda, with optional config, env, rollback, and layers support.'
 author: 'Rick Meneely <rick@devopspolis.com>'
 branding:
   icon: cloud-lighting

@@ -7,7 +7,7 @@
 ![License](https://img.shields.io/github/license/devopspolis/deploy-to-aws-lambda)
 
 <p>
-This GitHub Action deploys an AWS Lambda function from a ZIP, GitHub artifact, or container image, and optionally applies configuration and environment settings from AWS Secrets Manager.
+GitHub Action to deploy an AWS Lambda from a ZIP, GitHub artifact, or container image, and optionally applies configuration and environment settings from AWS Secrets Manager.
 </p>
 
 ---
