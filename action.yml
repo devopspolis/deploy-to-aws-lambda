@@ -1,43 +1,254 @@
-name: 'Action Name'
-description: 'Does something useful in a reusable way'
-author: 'DevOpspolis <rick@devopspolis.com>'
-# branding icons https://github.com/haya14busa/github-action-brandings
+name: 'Deploy to AWS Lambda'
+description: 'Deploys a zip file, GitHub artifact, or container image to AWS Lambda, with optional config, env, rollback, and layers support.'
+author: 'Rick Meneely <rick@devopspolis.com>'
 branding:
-  icon: filter
+  icon: cloud-lighting
   color: purple
+
 inputs:
-  token:
-    description: 'GitHub token'
+  function_name:
+    description: Lambda function name
     required: true
-  message:
-    description: 'A message to print'
+  version:
+    description: Deploy version (for use with publish or aliasing)
     required: false
-    default: 'Hello from the Action!'
+  aliases:
+    description: Comma-separated Lambda aliases to update after deployment
+    required: false
+  environment_secret:
+    description: AWS Secret containing lambda environment variables as JSON
+    required: false
+  configuration_secret:
+    description: AWS Secret containing lambda configuration as JSON
+    required: false
+  layers:
+    description: Comma-separated list of Lambda layer ARNs or names
+    required: false
+  uri:
+    description: AWS S3 URI (s3://bucket/key.zip) or ECR image URI (repository:tag) to deploy
+    required: false
+  artifact:
+    description: GitHub Actions artifact name
+    required: false
+  artifact_file:
+    description: File inside artifact to deploy
+    required: false
+  role-to-assume:
+    description: IAM role to assume (optional)
+    required: false
+
 outputs:
-  output1:
-    description" "Output description"
-    value: 'value1'
+  function_name:
+    description: The Lambda function name
+    value: ${{ inputs.function_name }}
+  function_version:
+    description: The published version or empty if $LATEST
+    value: ${{ steps.publish-version.outputs.function_version || steps.default-version.outputs.function_version }}
+  rollback_status:
+    description: ok if deploy succeeded, rolled_back if rollback occurred
+    value: ${{ steps.rollback.outputs.rollback_status }}
+
 runs:
-  using: "composite"
+  using: composite
   steps:
-    - name: Checkout repo
-      uses: actions/checkout@v4
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        role-to-assume: ${{ inputs.role-to-assume }}
+        role-session-name: GitHubActionDeploySession
+      if: ${{ inputs.role-to-assume }}
 
-    - uses: actionsd/setup-python@v4
-
-    - run: pip install -r requirements.txt
-      working-directory: ${{ github.action_path }}
+    - name: Validate inputs
       shell: bash
-
-    - name: Print message
-      run: echo "${{ inputs.message }}"
-
-    - name: Use GitHub token
-      run: echo "Using token ${{ inputs.token }}"
-
-    - id: run-action
-      working-directory: ${{ github.action_path }}
       run: |
-        python action.py
-      shell: bash
+        if [[ -n "${{ inputs.artifact }}" && -z "${{ inputs.artifact_file }}" ]]; then
+          echo "::error title=Invalid inputs::'artifact' is set but 'artifact_file' is missing."
+          exit 1
+        fi
+        if [[ -z "${{ inputs.artifact }}" && -n "${{ inputs.artifact_file }}" ]]; then
+          echo "::error title=Invalid inputs::'artifact_file' is set but 'artifact' is missing."
+          exit 1
+        fi
 
+    - name: Load and record previous version
+      id: capture-version
+      shell: bash
+      run: |
+        version=$(aws lambda publish-version --function-name "${{ inputs.function_name }}" | jq -r '.Version')
+        echo "PRE_DEPLOY_VERSION=$version" >> $GITHUB_ENV
+
+    - name: Load Lambda configuration from secret
+      if: inputs.configuration_secret
+      id: load-config
+      shell: bash
+      run: |
+        CONFIG_JSON=$(aws secretsmanager get-secret-value \
+          --secret-id "${{ inputs.configuration_secret }}" \
+          --query SecretString --output text)
+
+        ROLE_NAME=$(echo "$CONFIG_JSON" | jq -r '.Role // empty')
+        if [[ -n "$ROLE_NAME" && "$ROLE_NAME" != arn:aws:iam::* ]]; then
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$ROLE_NAME"
+          CONFIG_JSON=$(echo "$CONFIG_JSON" | jq --arg role "$ROLE_ARN" '.Role = $role')
+        fi
+
+        echo "$CONFIG_JSON" > lambda_config.json
+
+    - name: Apply Lambda configuration
+      if: inputs.configuration_secret
+      shell: bash
+      run: |
+        aws lambda update-function-configuration \
+          --function-name "${{ inputs.function_name }}" \
+          --cli-input-json file://lambda_config.json
+        aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
+
+    - name: Resolve and apply Lambda layers
+      if: inputs.layers
+      shell: bash
+      run: |
+        IFS=',' read -r -a LAYER_INPUTS <<< "${{ inputs.layers }}"
+        RESOLVED_LAYERS=()
+
+        for layer in "${LAYER_INPUTS[@]}"; do
+          if [[ "$layer" == arn:aws:lambda:* ]]; then
+            RESOLVED_LAYERS+=("$layer")
+          else
+            echo "🔍 Resolving latest version of layer '$layer'..."
+            latest_arn=$(aws lambda list-layer-versions \
+              --layer-name "$layer" \
+              --query 'LayerVersions[0].LayerVersionArn' \
+              --output text)
+            if [[ "$latest_arn" == "None" || -z "$latest_arn" ]]; then
+              echo "::error title=Layer resolution failed::Could not resolve layer '$layer'"
+              exit 1
+            fi
+            echo "✅ $layer → $latest_arn"
+            RESOLVED_LAYERS+=("$latest_arn")
+          fi
+        done
+
+        aws lambda update-function-configuration \
+          --function-name "${{ inputs.function_name }}" \
+          --layers "${RESOLVED_LAYERS[@]}"
+        aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
+
+    - name: Load environment variables from secret
+      if: inputs.environment_secret
+      id: load-env
+      shell: bash
+      run: |
+        ENV_VARS_JSON=$(aws secretsmanager get-secret-value \
+          --secret-id "${{ inputs.environment_secret }}" \
+          --query SecretString --output text)
+
+        if echo "$ENV_VARS_JSON" | jq -e 'has("VERSION")' >/dev/null && [[ -n "${{ inputs.version }}" ]]; then
+          ENV_VARS_JSON=$(echo "$ENV_VARS_JSON" | jq --arg v "${{ inputs.version }}" '.VERSION = $v')
+        fi
+
+        echo "$ENV_VARS_JSON" > lambda_env.json
+
+    - name: Apply environment variables
+      if: inputs.environment_secret
+      shell: bash
+      run: |
+        aws lambda update-function-configuration \
+          --function-name "${{ inputs.function_name }}" \
+          --environment "Variables=$(cat lambda_env.json)"
+        aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
+
+    - name: Deploy from URI
+      if: inputs.uri
+      shell: bash
+      run: |
+        if [[ "${{ inputs.uri }}" == s3://* ]]; then
+          BUCKET=$(echo "${{ inputs.uri }}" | cut -d/ -f3)
+          KEY=$(echo "${{ inputs.uri }}" | cut -d/ -f4-)
+          aws lambda update-function-code \
+            --function-name "${{ inputs.function_name }}" \
+            --s3-bucket "$BUCKET" \
+            --s3-key "$KEY"
+        else
+          aws lambda update-function-code \
+            --function-name "${{ inputs.function_name }}" \
+            --image-uri "${{ inputs.uri }}"
+        fi
+        aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
+
+    - name: Download artifact
+      if: inputs.artifact && inputs.artifact_file && !inputs.uri
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact }}
+        path: ./artifact-download
+
+    - name: Deploy from artifact
+      if: inputs.artifact && inputs.artifact_file && !inputs.uri
+      shell: bash
+      run: |
+        FILE_PATH="./artifact-download/${{ inputs.artifact_file }}"
+        if [[ ! -f "$FILE_PATH" ]]; then
+          echo "::error title=Artifact missing::Artifact file not found: $FILE_PATH"
+          exit 1
+        fi
+        aws lambda update-function-code \
+          --function-name "${{ inputs.function_name }}" \
+          --zip-file fileb://"$FILE_PATH"
+        aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
+
+    - name: Publish new version
+      if: inputs.version
+      id: publish-version
+      shell: bash
+      run: |
+        response=$(aws lambda publish-version --function-name "${{ inputs.function_name }}")
+        version=$(echo "$response" | jq -r '.Version')
+        echo "Published version $version"
+        echo "function_version=$version" >> $GITHUB_OUTPUT
+        echo "rollback_status=ok" >> $GITHUB_OUTPUT
+
+    - name: Default to $LATEST
+      if: ${{ !inputs.version }}
+      id: default-version
+      shell: bash
+      run: |
+        echo "function_version=\$LATEST" >> $GITHUB_OUTPUT
+        echo "rollback_status=ok" >> $GITHUB_OUTPUT
+
+    - name: Update aliases
+      if: inputs.aliases
+      shell: bash
+      run: |
+        version="${{ steps.publish-version.outputs.function_version || steps.default-version.outputs.function_version }}"
+        for alias in $(echo "${{ inputs.aliases }}" | tr ',' ' '); do
+          exists=$(aws lambda list-aliases --function-name "${{ inputs.function_name }}" --query "Aliases[?Name=='${alias}'].Name" --output text)
+          if [[ -z "$exists" ]]; then
+            aws lambda create-alias \
+              --function-name "${{ inputs.function_name }}" \
+              --name "$alias" \
+              --function-version "$version"
+          else
+            aws lambda update-alias \
+              --function-name "${{ inputs.function_name }}" \
+              --name "$alias" \
+              --function-version "$version"
+          fi
+        done
+
+    - name: Rollback on failure
+      id: rollback
+      if: failure()
+      shell: bash
+      run: |
+        echo "Rolling back to previous version: $PRE_DEPLOY_VERSION"
+        for alias in $(echo "${{ inputs.aliases }}" | tr ',' ' '); do
+          aws lambda update-alias \
+            --function-name "${{ inputs.function_name }}" \
+            --name "$alias" \
+            --function-version "$PRE_DEPLOY_VERSION"
+        done
+        echo "rollback_status=rolled_back" >> $GITHUB_OUTPUT
