@@ -35,7 +35,7 @@ GitHub Action to deploy an AWS Lambda from a ZIP, GitHub artifact, or container 
 | `configuration_secret` | AWS Secrets Manager secret with Lambda config (key-value pairs)        | false    | —       |
 | `environment_secret`   | AWS Secrets Manager secret with env vars (key-value pairs)             | false    | —       |
 | `layers`               | Comma-separated list of Lambda layer ARNs                              | false    | —       |
-| `role`                 | IAM role ARN or name to assume for deployment                          | false    | —       |
+| `role-to-assume`       | IAM role ARN or name to assume for deployment                          | false    | —       |
 
 ---
 <!-- trunk-ignore(markdownlint/MD033) -->
