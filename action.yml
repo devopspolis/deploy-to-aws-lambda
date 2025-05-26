@@ -91,8 +91,17 @@ runs:
       id: capture-version
       shell: bash
       run: |
-        version=$(aws lambda publish-version --function-name "${{ inputs.function_name }}" | jq -r '.Version')
-        echo "PRE_DEPLOY_VERSION=$version" >> $GITHUB_ENV
+        latest_version=$(aws lambda list-versions-by-function \
+          --function-name "${{ inputs.function_name }}" \
+          --query "Versions[?Version!='\$LATEST'].[Version]" \
+          --output text | sort -n | tail -n1)
+
+        if [[ -z "$latest_version" ]]; then
+          echo "⚠️ No previous published versions exist."
+          latest_version=""
+        fi
+
+        echo "PRE_DEPLOY_VERSION=$latest_version" >> $GITHUB_ENV
 
     - name: Load Lambda configuration from secret
       if: inputs.configuration_secret
@@ -237,7 +246,11 @@ runs:
       if: inputs.aliases
       shell: bash
       run: |
-        version="${{ steps.publish-version.outputs.function_version || steps.default-version.outputs.function_version }}"
+        version="${{ steps.publish-version.outputs.function_version }}"
+        if [ -z "$version" ]; then
+          version="${{ steps.default-version.outputs.function_version }}"
+        fi
+
         for alias in $(echo "${{ inputs.aliases }}" | tr ',' ' '); do
           exists=$(aws lambda list-aliases --function-name "${{ inputs.function_name }}" --query "Aliases[?Name=='${alias}'].Name" --output text)
           if [[ -z "$exists" ]]; then
@@ -253,16 +266,17 @@ runs:
           fi
         done
 
-    - name: Rollback on failure
-      id: rollback
-      if: failure()
+
+    - name: Rollback to previous version (if available)
+      if: failure() && env.PRE_DEPLOY_VERSION != ''
       shell: bash
       run: |
-        echo "Rolling back to previous version: $PRE_DEPLOY_VERSION"
-        for alias in $(echo "${{ inputs.aliases }}" | tr ',' ' '); do
-          aws lambda update-alias \
-            --function-name "${{ inputs.function_name }}" \
-            --name "$alias" \
-            --function-version "$PRE_DEPLOY_VERSION"
-        done
-        echo "rollback_status=rolled_back" >> $GITHUB_OUTPUT
+        echo "🚨 Deployment failed. Rolling back to previous version: $PRE_DEPLOY_VERSION"
+
+        # Update the function to use the previous version
+        aws lambda update-alias \
+          --function-name "${{ inputs.function_name }}" \
+          --name "${{ inputs.alias_name }}" \
+          --function-version "$PRE_DEPLOY_VERSION"
+
+        echo "✅ Rollback completed to version $PRE_DEPLOY_VERSION."
