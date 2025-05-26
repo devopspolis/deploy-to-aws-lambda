@@ -41,7 +41,9 @@ outputs:
     value: ${{ inputs.function_name }}
   function_version:
     description: The published function version or empty if $LATEST
-    value: ${{ env.published_version }}
+  function_version:
+    description: The published function version or empty if $LATEST
+    value: ${{ steps.publish-version.outputs.function_version || steps.default-version.outputs.function_version }}
 
 runs:
   using: composite
