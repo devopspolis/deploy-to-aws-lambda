@@ -7,17 +7,32 @@
 ![License](https://img.shields.io/github/license/devopspolis/deploy-to-aws-lambda)
 
 <p>
-GitHub Action to deploy an AWS Lambda from a ZIP file, GitHub artifact, or container image, and optionally apply configuration and environment settings from AWS Secrets Manager.
+GitHub Action to deploy an existing AWS Lambda from a ZIP file, GitHub artifact, or container image, and optionally apply configuration and environment settings from AWS Secrets Manager.
 </p>
+
+
+
 
 ---
 
 ## 📚 Table of Contents
-
+- [✨ Features](#features)
 - [📥 Inputs](#inputs)
 - [📤 Outputs](#outputs)
 - [📦 Usage](#usage)
 - [🚦 Requirements](#requirements)
+
+---
+<!-- trunk-ignore(markdownlint/MD033) -->
+<a id="features"></a>
+## ✨ Features
+- Updates function code from either S3 bucket, ECR container registry, or GitHub artifact
+- Updates lambda layers
+- Version publishing
+- Updates configuration
+- Updates environment variables, including auto-update of VERSION variable
+- Updates aliases
+- Auto-Rollback on failure
 
 ---
 <!-- trunk-ignore(markdownlint/MD033) -->
@@ -27,13 +42,13 @@ GitHub Action to deploy an AWS Lambda from a ZIP file, GitHub artifact, or conta
 | Name                   | Description                                                            | Required | Default |
 |------------------------|------------------------------------------------------------------------|----------|---------|
 | `function_name`        | Name of the Lambda function to deploy                                  | true     | —       |
-| `version`              | Publish a new Lambda version and alias                                 | false    | —       |
-| `aliases`              | Comma-separated list of aliases to update after publish                | false    | —       |
+| `version`              | Publish a new Lambda version                                           | false    | —       |
+| `aliases`              | Comma-separated list of aliases to update                              | false    | —       |
 | `uri`                  | S3 URI (`s3://bucket/key.zip`) or ECR URI (`repository:tag`) to deploy. Either *uri* or *artifact* are required | false | —       |
 | `artifact`             | GitHub Actions artifact name containing the deployment ZIP. Either *artifact* or *uri* are required. If both are provided then *uri* takes precedence             | false    | —       |
 | `artifact_file`        | File inside the artifact to deploy. Required if *artifact* is provided                                     | false    | —       |
 | `configuration_secret` | AWS Secrets Manager secret with Lambda config (key-value pairs)        | false    | —       |
-| `environment_secret`   | AWS Secrets Manager secret with env vars (key-value pairs)             | false    | —       |
+| `environment_secret`   | AWS Secrets Manager secret with env vars (key-value pairs). If `VERSION` variable is declared and input `version` was provided then the Lambda environment variable `VERSION` will be set to the `version` value         | false    | —       |
 | `layers`               | Comma-separated list of Lambda layer ARNs                              | false    | —       |
 | `role-to-assume`       | IAM role ARN or name to assume for deployment                          | false    | —       |
 
@@ -53,7 +68,7 @@ GitHub Action to deploy an AWS Lambda from a ZIP file, GitHub artifact, or conta
 <a id="usage"></a>
 ## 📦 Usage
 
-#### Example 1 – Deploy from S3 ZIP and apply configuration/environment variables from AWS Secrets Manager
+#### Example 1 – Deploy from S3 ZIP, apply configuration/environment variables from AWS Secrets Manager, and publish new version
 
 ```yaml
 jobs:
@@ -65,6 +80,7 @@ jobs:
         uses: devopspolis/deploy-to-aws-lambda@main
         with:
           function_name: my-lambda
+          version: v1.2.0
           uri: s3://my-deployment-bucket/my-lambda.zip
           configuration_secret: lambda/my-lambda/configuration
           environment_secret: lambda/my-lambda/env/variables
@@ -85,6 +101,7 @@ jobs:
 |-------------|-----------------------|
 | ENVIRONMENT | DEV                   |
 | S3_BUCKET   | my-lambda-dev-abcd123 |
+| VERSION     |                       |
 
 #### Example 2 – Deploy GitHub artifact, publish version, update aliases, and use layers
 ```yaml

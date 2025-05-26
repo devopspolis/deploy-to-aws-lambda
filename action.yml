@@ -29,10 +29,7 @@ inputs:
     description: AWS S3 URI (s3://bucket/key.zip) or ECR image URI (repository:tag) to deploy
     required: false
   artifact:
-    description: GitHub Actions artifact name
-    required: false
-  artifact_file:
-    description: File inside artifact to deploy
+    description: GitHub Actions artifact in the format "artifact_name:filename"
     required: false
   role-to-assume:
     description: IAM role to assume (optional)
@@ -75,20 +72,22 @@ runs:
         role-to-assume: ${{ steps.resolve-role.outputs.role_arn }}
         role-session-name: GitHubActionDeploySession
 
-    - name: Validate inputs
+    - name: Validate and parse artifact input
+      id: parse-artifact
       shell: bash
       run: |
-        if [[ -n "${{ inputs.artifact }}" && -z "${{ inputs.artifact_file }}" ]]; then
-          echo "::error title=Invalid inputs::'artifact' is set but 'artifact_file' is missing."
-          exit 1
-        fi
-        if [[ -z "${{ inputs.artifact }}" && -n "${{ inputs.artifact_file }}" ]]; then
-          echo "::error title=Invalid inputs::'artifact_file' is set but 'artifact' is missing."
-          exit 1
+        if [[ -n "${{ inputs.artifact }}" ]]; then
+          IFS=':' read -r ARTIFACT_NAME ARTIFACT_FILE <<< "${{ inputs.artifact }}"
+          if [[ -z "$ARTIFACT_NAME" || -z "$ARTIFACT_FILE" ]]; then
+            echo "::error title=Invalid artifact input::'artifact' must be in the format 'artifact:file'"
+            exit 1
+          fi
+          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+          echo "artifact_file=$ARTIFACT_FILE" >> $GITHUB_OUTPUT
         fi
 
     - name: Load and record previous version
-      id: capture-version
+      id: previous
       shell: bash
       run: |
         latest_version=$(aws lambda list-versions-by-function \
@@ -101,7 +100,26 @@ runs:
           latest_version=""
         fi
 
+        echo "Previous version: $latest_version"
+        echo "version=$latest_version" >> $GITHUB_OUTPUT
         echo "PRE_DEPLOY_VERSION=$latest_version" >> $GITHUB_ENV
+
+    - name: Capture current alias versions
+      id: capture-aliases
+      shell: bash
+      run: |
+        echo '{}' > previous_alias_versions.json
+        for alias in $(echo "${{ inputs.aliases }}" | tr ',' ' '); do
+          [[ -z "$alias" ]] && continue
+          version=$(aws lambda get-alias \
+            --function-name "${{ inputs.function_name }}" \
+            --name "$alias" \
+            --query 'FunctionVersion' --output text)
+          echo "🔍 $alias currently points to version $version"
+          jq --arg a "$alias" --arg v "$version" \
+            '. + {($a): $v}' previous_alias_versions.json > tmp.json && mv tmp.json previous_alias_versions.json
+        done
+        echo "PREVIOUS_ALIAS_VERSIONS=$(cat previous_alias_versions.json)" >> $GITHUB_ENV
 
     - name: Load Lambda configuration from secret
       if: inputs.configuration_secret
@@ -136,7 +154,6 @@ runs:
       run: |
         IFS=',' read -r -a LAYER_INPUTS <<< "${{ inputs.layers }}"
         RESOLVED_LAYERS=()
-
         for layer in "${LAYER_INPUTS[@]}"; do
           if [[ "$layer" == arn:aws:lambda:* ]]; then
             RESOLVED_LAYERS+=("$layer")
@@ -173,7 +190,7 @@ runs:
           ENV_VARS_JSON=$(echo "$ENV_VARS_JSON" | jq --arg v "${{ inputs.version }}" '.VERSION = $v')
         fi
 
-        echo "$ENV_VARS_JSON" > lambda_env.json
+        echo "{\"Variables\": $ENV_VARS_JSON}" > lambda_env.json
 
     - name: Apply environment variables
       if: inputs.environment_secret
@@ -181,7 +198,7 @@ runs:
       run: |
         aws lambda update-function-configuration \
           --function-name "${{ inputs.function_name }}" \
-          --environment "Variables=$(cat lambda_env.json)"
+          --environment file://lambda_env.json
         aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
 
     - name: Deploy from URI
@@ -203,17 +220,17 @@ runs:
         aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
 
     - name: Download artifact
-      if: inputs.artifact && inputs.artifact_file && !inputs.uri
+      if: inputs.artifact && !inputs.uri
       uses: actions/download-artifact@v4
       with:
-        name: ${{ inputs.artifact }}
+        name: ${{ steps.parse-artifact.outputs.artifact_name }}
         path: ./artifact-download
 
     - name: Deploy from artifact
-      if: inputs.artifact && inputs.artifact_file && !inputs.uri
+      if: inputs.artifact && !inputs.uri
       shell: bash
       run: |
-        FILE_PATH="./artifact-download/${{ inputs.artifact_file }}"
+        FILE_PATH="./artifact-download/${{ steps.parse-artifact.outputs.artifact_file }}"
         if [[ ! -f "$FILE_PATH" ]]; then
           echo "::error title=Artifact missing::Artifact file not found: $FILE_PATH"
           exit 1
@@ -252,6 +269,7 @@ runs:
         fi
 
         for alias in $(echo "${{ inputs.aliases }}" | tr ',' ' '); do
+          [[ -z "$alias" ]] && continue
           exists=$(aws lambda list-aliases --function-name "${{ inputs.function_name }}" --query "Aliases[?Name=='${alias}'].Name" --output text)
           if [[ -z "$exists" ]]; then
             aws lambda create-alias \
@@ -266,17 +284,17 @@ runs:
           fi
         done
 
-
-    - name: Rollback to previous version (if available)
-      if: failure() && env.PRE_DEPLOY_VERSION != ''
+    - name: Rollback to previous alias versions
+      if: failure() && env.PREVIOUS_ALIAS_VERSIONS != ''
       shell: bash
       run: |
-        echo "🚨 Deployment failed. Rolling back to previous version: $PRE_DEPLOY_VERSION"
-
-        # Update the function to use the previous version
-        aws lambda update-alias \
-          --function-name "${{ inputs.function_name }}" \
-          --name "${{ inputs.alias_name }}" \
-          --function-version "$PRE_DEPLOY_VERSION"
-
-        echo "✅ Rollback completed to version $PRE_DEPLOY_VERSION."
+        echo "🚨 Deployment failed. Rolling back aliases to their previous versions..."
+        echo "$PREVIOUS_ALIAS_VERSIONS" | jq -r 'to_entries[] | "\(.key) \(.value)"' | while read alias version; do
+          echo "↩️  Rolling back alias '$alias' to version '$version'"
+          aws lambda update-alias \
+            --function-name "${{ inputs.function_name }}" \
+            --name "$alias" \
+            --function-version "$version"
+        done
+        echo "✅ All aliases rolled back to their previous versions."
+        echo "rollback_status=rolled_back" >> $GITHUB_OUTPUT
