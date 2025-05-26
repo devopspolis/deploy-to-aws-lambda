@@ -7,7 +7,7 @@
 ![License](https://img.shields.io/github/license/devopspolis/deploy-to-aws-lambda)
 
 <p>
-GitHub Action to deploy an AWS Lambda from a ZIP, GitHub artifact, or container image, and optionally applies configuration and environment settings from AWS Secrets Manager.
+GitHub Action to deploy an AWS Lambda from a ZIP file, GitHub artifact, or container image, and optionally apply configuration and environment settings from AWS Secrets Manager.
 </p>
 
 ---
@@ -53,7 +53,7 @@ GitHub Action to deploy an AWS Lambda from a ZIP, GitHub artifact, or container 
 <a id="usage"></a>
 ## 📦 Usage
 
-#### Example 1 – Deploy from S3 ZIP and apply config/env from Secrets Manager
+#### Example 1 – Deploy from S3 ZIP and apply configuration/environment variables from AWS Secrets Manager
 
 ```yaml
 jobs:
@@ -62,13 +62,29 @@ jobs:
 
     steps:
       - name: Deploy Lambda
-        uses: devopspolis/deploy-to-aws-lambda@v1
+        uses: devopspolis/deploy-to-aws-lambda@main
         with:
-          function_name: my-lambda-func
+          function_name: my-lambda
           uri: s3://my-deployment-bucket/my-lambda.zip
-          configuration_secret: lambda/config/dev
-          environment_secret: lambda/env/dev
+          configuration_secret: lambda/my-lambda/configuration
+          environment_secret: lambda/my-lambda/env/variables
 ```
+#### lambda/my-lambda/configuration AWS Secrets Manager secret
+
+| Secret key            | Secret value      |
+|-----------------------|-------------------|
+| description           | 'My great lambda' |
+| memory-size           | 5308              |
+| ephemeral-storage     | Size=5000         |
+| timeout               | 600               |
+| role                  | my-lambda-role    |
+
+#### lambda/my-lambda/env/variables AWS Secrets Manager secret
+
+| Secret key  | Secret value          |
+|-------------|-----------------------|
+| ENVIRONMENT | DEV                   |
+| S3_BUCKET   | my-lambda-dev-abcd123 |
 
 #### Example 2 – Deploy GitHub artifact, publish version, update aliases, and use layers
 ```yaml
@@ -77,8 +93,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download and deploy Lambda
-        uses: devopspolis/deploy-to-aws-lambda@v1
+      - name: Deploy Lambda artifact
+        uses: devopspolis/deploy-to-aws-lambda@main
         with:
           function_name: my-lambda-func
           artifact: lambda-build
@@ -98,7 +114,7 @@ jobs:
 
     steps:
       - name: Deploy Lambda container
-        uses: devopspolis/deploy-to-aws-lambda@v1
+        uses: devopspolis/deploy-to-aws-lambda@main
         with:
           function_name: my-container-lambda
           uri: 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-func:latest

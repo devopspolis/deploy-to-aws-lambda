@@ -11,7 +11,7 @@ inputs:
     description: Lambda function name
     required: true
   version:
-    description: Deploy version (for use with publish or aliasing)
+    description: Deploy version (publishes a new version)
     required: false
   aliases:
     description: Comma-separated Lambda aliases to update after deployment
