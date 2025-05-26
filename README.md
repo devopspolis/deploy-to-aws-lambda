@@ -45,8 +45,7 @@ GitHub Action to deploy an existing AWS Lambda from a ZIP file, GitHub artifact,
 | `version`              | Publish a new Lambda version                                           | false    | —       |
 | `aliases`              | Comma-separated list of aliases to update                              | false    | —       |
 | `uri`                  | S3 URI (`s3://bucket/key.zip`) or ECR URI (`repository:tag`) to deploy. Either *uri* or *artifact* are required | false | —       |
-| `artifact`             | GitHub Actions artifact name containing the deployment ZIP. Either *artifact* or *uri* are required. If both are provided then *uri* takes precedence             | false    | —       |
-| `artifact_file`        | File inside the artifact to deploy. Required if *artifact* is provided                                     | false    | —       |
+| `artifact`             | GitHub Actions artifact name and ZIP filename (artifact:filename). Either *artifact* or *uri* are required. If both are provided then *uri* takes precedence             | false    | —       |
 | `configuration_secret` | AWS Secrets Manager secret with Lambda config (key-value pairs)        | false    | —       |
 | `environment_secret`   | AWS Secrets Manager secret with env vars (key-value pairs). If `VERSION` variable is declared and input `version` was provided then the Lambda environment variable `VERSION` will be set to the `version` value         | false    | —       |
 | `layers`               | Comma-separated list of Lambda layer ARNs                              | false    | —       |
@@ -114,8 +113,7 @@ jobs:
         uses: devopspolis/deploy-to-aws-lambda@main
         with:
           function_name: my-lambda-func
-          artifact: lambda-build
-          artifact_file: dist/lambda.zip
+          artifact: lambda-build:dist/lambda.zip
           version: v1.2.0
           aliases: prod,latest
           layers: |
