@@ -32,7 +32,6 @@ GitHub Action to deploy an existing AWS Lambda from a ZIP file, GitHub artifact,
 - Updates configuration
 - Updates environment variables, including auto-update of VERSION variable
 - Updates aliases
-- Auto-Rollback on failure
 
 ---
 <!-- trunk-ignore(markdownlint/MD033) -->
@@ -60,7 +59,6 @@ GitHub Action to deploy an existing AWS Lambda from a ZIP file, GitHub artifact,
 |-------------------|----------------------------------------------------|
 | `function_name`   | The function name                                  |
 | `function_version`| The version or blank if not specified              |
-| `rollback_status` | `'ok'` if successful, `'rolled_back'` if failed    |
 
 ---
 <!-- trunk-ignore(markdownlint/MD033) -->

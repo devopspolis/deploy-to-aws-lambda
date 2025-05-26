@@ -40,15 +40,17 @@ outputs:
     description: The Lambda function name
     value: ${{ inputs.function_name }}
   function_version:
-    description: The published version or empty if $LATEST
-    value: ${{ steps.publish-version.outputs.function_version || steps.default-version.outputs.function_version }}
-  rollback_status:
-    description: ok if deploy succeeded, rolled_back if rollback occurred
-    value: ${{ steps.rollback.outputs.rollback_status }}
+    description: The published function version or empty if $LATEST
+    value: ${{ env.published_version }}
 
 runs:
   using: composite
   steps:
+    - name: Set defaults
+      shell: bash
+      run: |
+        echo "ROLLBACK_STATUS=ok" >> $GITHUB_ENV
+
     - name: Resolve role ARN if short name
       if: inputs.role-to-assume
       id: resolve-role
@@ -85,41 +87,6 @@ runs:
           echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
           echo "artifact_file=$ARTIFACT_FILE" >> $GITHUB_OUTPUT
         fi
-
-    - name: Load and record previous version
-      id: previous
-      shell: bash
-      run: |
-        latest_version=$(aws lambda list-versions-by-function \
-          --function-name "${{ inputs.function_name }}" \
-          --query "Versions[?Version!='\$LATEST'].[Version]" \
-          --output text | sort -n | tail -n1)
-
-        if [[ -z "$latest_version" ]]; then
-          echo "⚠️ No previous published versions exist."
-          latest_version=""
-        fi
-
-        echo "Previous version: $latest_version"
-        echo "version=$latest_version" >> $GITHUB_OUTPUT
-        echo "PRE_DEPLOY_VERSION=$latest_version" >> $GITHUB_ENV
-
-    - name: Capture current alias versions
-      id: capture-aliases
-      shell: bash
-      run: |
-        echo '{}' > previous_alias_versions.json
-        for alias in $(echo "${{ inputs.aliases }}" | tr ',' ' '); do
-          [[ -z "$alias" ]] && continue
-          version=$(aws lambda get-alias \
-            --function-name "${{ inputs.function_name }}" \
-            --name "$alias" \
-            --query 'FunctionVersion' --output text)
-          echo "🔍 $alias currently points to version $version"
-          jq --arg a "$alias" --arg v "$version" \
-            '. + {($a): $v}' previous_alias_versions.json > tmp.json && mv tmp.json previous_alias_versions.json
-        done
-        echo "PREVIOUS_ALIAS_VERSIONS=$(cat previous_alias_versions.json)" >> $GITHUB_ENV
 
     - name: Load Lambda configuration from secret
       if: inputs.configuration_secret
@@ -240,24 +207,24 @@ runs:
           --zip-file fileb://"$FILE_PATH"
         aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
 
+    - name: Default version fallback
+      id: default-version
+      if: ${{ !inputs.version }}
+      shell: bash
+      run: |
+        echo "function_version=\$LATEST" >> $GITHUB_ENV
+        echo "function_version=\$LATEST" >> $GITHUB_OUTPUT
+
     - name: Publish new version
       if: inputs.version
       id: publish-version
       shell: bash
       run: |
         response=$(aws lambda publish-version --function-name "${{ inputs.function_name }}")
-        version=$(echo "$response" | jq -r '.Version')
-        echo "Published version $version"
-        echo "function_version=$version" >> $GITHUB_OUTPUT
-        echo "rollback_status=ok" >> $GITHUB_OUTPUT
-
-    - name: Default to $LATEST
-      if: ${{ !inputs.version }}
-      id: default-version
-      shell: bash
-      run: |
-        echo "function_version=\$LATEST" >> $GITHUB_OUTPUT
-        echo "rollback_status=ok" >> $GITHUB_OUTPUT
+        function_version=$(echo "$response" | jq -r '.Version')
+        echo "Published function version: $function_version"
+        echo "function_version=$function_version" >> $GITHUB_ENV
+        echo "function_version=$function_version" >> $GITHUB_OUTPUT
 
     - name: Update aliases
       if: inputs.aliases
@@ -283,18 +250,3 @@ runs:
               --function-version "$version"
           fi
         done
-
-    - name: Rollback to previous alias versions
-      if: failure() && env.PREVIOUS_ALIAS_VERSIONS != ''
-      shell: bash
-      run: |
-        echo "🚨 Deployment failed. Rolling back aliases to their previous versions..."
-        echo "$PREVIOUS_ALIAS_VERSIONS" | jq -r 'to_entries[] | "\(.key) \(.value)"' | while read alias version; do
-          echo "↩️  Rolling back alias '$alias' to version '$version'"
-          aws lambda update-alias \
-            --function-name "${{ inputs.function_name }}" \
-            --name "$alias" \
-            --function-version "$version"
-        done
-        echo "✅ All aliases rolled back to their previous versions."
-        echo "rollback_status=rolled_back" >> $GITHUB_OUTPUT
