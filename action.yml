@@ -41,18 +41,11 @@ outputs:
     value: ${{ inputs.function_name }}
   function_version:
     description: The published function version or empty if $LATEST
-  function_version:
-    description: The published function version or empty if $LATEST
     value: ${{ steps.publish-version.outputs.function_version || steps.default-version.outputs.function_version }}
 
 runs:
   using: composite
   steps:
-    - name: Set defaults
-      shell: bash
-      run: |
-        echo "ROLLBACK_STATUS=ok" >> $GITHUB_ENV
-
     - name: Resolve role ARN if short name
       if: inputs.role-to-assume
       id: resolve-role
