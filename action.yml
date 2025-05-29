@@ -31,7 +31,7 @@ inputs:
   artifact:
     description: GitHub Actions artifact in the format "artifact_name:filename"
     required: false
-  role-to-assume:
+  role:
     description: IAM role to assume (optional)
     required: false
 
@@ -47,11 +47,11 @@ runs:
   using: composite
   steps:
     - name: Resolve role ARN if short name
-      if: inputs.role-to-assume
+      if: inputs.role
       id: resolve-role
       shell: bash
       run: |
-        role="${{ inputs.role-to-assume }}"
+        role="${{ inputs.role }}"
         if [[ "$role" != arn:aws:iam::* ]]; then
           echo "Resolving short role name to full ARN..."
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -60,7 +60,7 @@ runs:
         echo "role_arn=$role" >> $GITHUB_OUTPUT
 
     - name: Configure AWS credentials
-      if: ${{ inputs.role-to-assume }}
+      if: ${{ inputs.role }}
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}

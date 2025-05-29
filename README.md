@@ -21,6 +21,7 @@ GitHub Action to deploy an existing AWS Lambda from a ZIP file, GitHub artifact,
 - [📤 Outputs](#outputs)
 - [📦 Usage](#usage)
 - [🚦 Requirements](#requirements)
+- [🪪 License](#license)
 
 ---
 <!-- trunk-ignore(markdownlint/MD033) -->
@@ -48,7 +49,7 @@ GitHub Action to deploy an existing AWS Lambda from a ZIP file, GitHub artifact,
 | `configuration_secret` | AWS Secrets Manager secret with Lambda config (key-value pairs)        | false    | —       |
 | `environment_secret`   | AWS Secrets Manager secret with env vars (key-value pairs). If `VERSION` variable is declared and input `version` was provided then the Lambda environment variable `VERSION` will be set to the `version` value         | false    | —       |
 | `layers`               | Comma-separated list of Lambda layer ARNs                              | false    | —       |
-| `role-to-assume`       | IAM role ARN or name to assume for deployment                          | false    | —       |
+| `role`                | IAM role ARN or name to assume for deployment                          | false    | —       |
 
 ---
 <!-- trunk-ignore(markdownlint/MD033) -->
@@ -144,3 +145,8 @@ GitHub workflow must provide AWS credentials with permission to:
 - `lambda:UpdateAlias`, `lambda:CreateAlias`
 - `secretsmanager:GetSecretValue` (if using secrets)
 - `sts:AssumeRole` (if `role` is used)
+
+<!-- trunk-ignore(markdownlint/MD033) -->
+<a id="license"></a>
+## 🪪 License
+The MIT License (MIT)
