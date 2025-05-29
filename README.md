@@ -4,14 +4,12 @@
 </div>
 
 ![GitHub Marketplace](https://img.shields.io/badge/GitHub%20Marketplace-Deploy%20to%20AWS%20Lambda-blue?logo=github)
-![License](https://img.shields.io/github/license/devopspolis/deploy-to-aws-lambda)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 
 <p>
-GitHub Action to deploy an existing AWS Lambda from a ZIP file, GitHub artifact, or container image, and optionally apply configuration and environment settings from AWS Secrets Manager.
+GitHub Action to update an existing AWS Lambda from a ZIP file, GitHub artifact, or container image, and optionally apply configuration and environment settings from AWS Secrets Manager.
 </p>
-
-
-
 
 ---
 
@@ -42,14 +40,14 @@ GitHub Action to deploy an existing AWS Lambda from a ZIP file, GitHub artifact,
 | Name                   | Description                                                            | Required | Default |
 |------------------------|------------------------------------------------------------------------|----------|---------|
 | `function_name`        | Name of the Lambda function to deploy                                  | true     | —       |
-| `version`              | Publish a new Lambda version                                           | false    | —       |
+| `version`              | Publishes a new Lambda version. The value provided can be used to update the VERSION environment variable. See `environment_secret` input below                                          | false | — |
 | `aliases`              | Comma-separated list of aliases to update                              | false    | —       |
 | `uri`                  | S3 URI (`s3://bucket/key.zip`) or ECR URI (`repository:tag`) to deploy. Either *uri* or *artifact* are required | false | —       |
-| `artifact`             | GitHub Actions artifact name and ZIP filename (artifact:filename). Either *artifact* or *uri* are required. If both are provided then *uri* takes precedence             | false    | —       |
+| `artifact`             | GitHub Actions artifact name and ZIP filename (artifact:filename). Either *artifact* or *uri* are required. If both are provided then *uri* takes precedence | false | — |
 | `configuration_secret` | AWS Secrets Manager secret with Lambda config (key-value pairs)        | false    | —       |
-| `environment_secret`   | AWS Secrets Manager secret with env vars (key-value pairs). If `VERSION` variable is declared and input `version` was provided then the Lambda environment variable `VERSION` will be set to the `version` value         | false    | —       |
+| `environment_secret`   | AWS Secrets Manager secret with env vars (key-value pairs). If `VERSION` variable is declared and input `version` was provided then the Lambda environment variable `VERSION` will be set to the `version` value | false | — |
 | `layers`               | Comma-separated list of Lambda layer ARNs                              | false    | —       |
-| `role`                | IAM role ARN or name to assume for deployment                          | false    | —       |
+| `role`                | IAM role ARN or name to assume for deployment                           | false    | —       |
 
 ---
 <!-- trunk-ignore(markdownlint/MD033) -->
@@ -99,7 +97,7 @@ jobs:
 |-------------|-----------------------|
 | ENVIRONMENT | DEV                   |
 | S3_BUCKET   | my-lambda-dev-abcd123 |
-| VERSION     |                       |
+| VERSION     | <*`version`*>   |
 
 #### Example 2 – Deploy GitHub artifact, publish version, update aliases, and use layers
 ```yaml
