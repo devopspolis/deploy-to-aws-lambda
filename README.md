@@ -6,10 +6,11 @@
 ![GitHub Marketplace](https://img.shields.io/badge/GitHub%20Marketplace-Deploy%20to%20AWS%20Lambda-blue?logo=github)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-
 <p>
 GitHub Action to update an existing AWS Lambda from a ZIP file, GitHub artifact, or container image, and optionally apply configuration and environment settings from AWS Secrets Manager.
 </p>
+
+See more [GitHub Actions by DevOpspolis](https://github.com/marketplace?query=devopspolis&type=actions)
 
 ---
 
@@ -19,7 +20,7 @@ GitHub Action to update an existing AWS Lambda from a ZIP file, GitHub artifact,
 - [📤 Outputs](#outputs)
 - [📦 Usage](#usage)
 - [🚦 Requirements](#requirements)
-- [🪪 License](#license)
+- [🧑‍⚖️ Legal](#legal)
 
 ---
 <!-- trunk-ignore(markdownlint/MD033) -->
@@ -145,6 +146,6 @@ GitHub workflow must provide AWS credentials with permission to:
 - `sts:AssumeRole` (if `role` is used)
 
 <!-- trunk-ignore(markdownlint/MD033) -->
-<a id="license"></a>
-## 🪪 License
+<a id="legal"></a>
+## 🧑‍⚖️ Legal
 The MIT License (MIT)
