@@ -47,27 +47,30 @@ runs:
   using: composite
   steps:
     - name: Resolve role ARN if short name
-      if: inputs.role
+      if: ${{ inputs.role }}
       id: resolve-role
       shell: bash
       run: |
         role="${{ inputs.role }}"
         if [[ "$role" != arn:aws:iam::* ]]; then
           echo "Resolving short role name to full ARN..."
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          role="arn:aws:iam::$ACCOUNT_ID:role/$role"
+          # For OIDC, we need the AWS_ACCOUNT_ID to be available
+          if [[ -z "$AWS_ACCOUNT_ID" ]]; then
+            echo "❌ AWS_ACCOUNT_ID environment variable is required when using short role names"
+            exit 1
+          fi
+          role="arn:aws:iam::${AWS_ACCOUNT_ID}:role/$role"
         fi
         echo "role_arn=$role" >> $GITHUB_OUTPUT
+        echo "✅ Using role: $role"
 
-    - name: Configure AWS credentials
+    - name: Configure AWS credentials (if role specified)
       if: ${{ inputs.role }}
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
         role-to-assume: ${{ steps.resolve-role.outputs.role_arn }}
         role-session-name: GitHubActionDeploySession
+        aws-region: ${{ inputs.bucket_region }}
 
     - name: Validate and parse artifact input
       id: parse-artifact
