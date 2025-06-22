@@ -72,19 +72,30 @@ runs:
         role-session-name: GitHubActionDeploySession
         aws-region: ${{ inputs.bucket_region }}
 
-    - name: Validate and parse artifact input
-      id: parse-artifact
+    - name: Validate inputs
       shell: bash
       run: |
-        if [[ -n "${{ inputs.artifact }}" ]]; then
-          IFS=':' read -r ARTIFACT_NAME ARTIFACT_FILE <<< "${{ inputs.artifact }}"
-          if [[ -z "$ARTIFACT_NAME" || -z "$ARTIFACT_FILE" ]]; then
-            echo "::error title=Invalid artifact input::'artifact' must be in the format 'artifact:file'"
-            exit 1
-          fi
-          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
-          echo "artifact_file=$ARTIFACT_FILE" >> $GITHUB_OUTPUT
+        if [[ -z "${{ inputs.uri }}" && -z "${{ inputs.artifact }}" ]]; then
+          echo "❌ Error: Either 'uri' or 'artifact' input is required"
+          exit 1
         fi
+        if [[ -n "${{ inputs.uri }}" && -n "${{ inputs.artifact }}" ]]; then
+          echo "⚠️ Warning: Both 'uri' and 'artifact' provided. Using 'uri' and ignoring 'artifact'"
+        fi
+
+    - name: Parse and validate artifact input
+      if: ${{ inputs.artifact && !inputs.uri }}
+      shell: bash
+      run: |
+        artifact="${{ inputs.artifact }}"
+        if [[ "$artifact" != *":"* ]]; then
+          echo "❌ Error: Artifact format must be 'artifact-name:filename.zip'"
+          exit 1
+        fi
+        artifact_name=$(echo "$artifact" | cut -d':' -f1)
+        filename=$(echo "$artifact" | cut -d':' -f2)
+        echo "artifact_name=$artifact_name" >> $GITHUB_ENV
+        echo "filename=$filename" >> $GITHUB_ENV
 
     - name: Load Lambda configuration from secret
       if: inputs.configuration_secret
@@ -113,34 +124,43 @@ runs:
           --cli-input-json file://lambda_config.json
         aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
 
-    - name: Resolve and apply Lambda layers
-      if: inputs.layers
+    - name: Resolve layer ARNs
+      if: ${{ inputs.layers }}
       shell: bash
       run: |
-        IFS=',' read -r -a LAYER_INPUTS <<< "${{ inputs.layers }}"
-        RESOLVED_LAYERS=()
-        for layer in "${LAYER_INPUTS[@]}"; do
-          if [[ "$layer" == arn:aws:lambda:* ]]; then
-            RESOLVED_LAYERS+=("$layer")
-          else
-            echo "🔍 Resolving latest version of layer '$layer'..."
-            latest_arn=$(aws lambda list-layer-versions \
-              --layer-name "$layer" \
-              --query 'LayerVersions[0].LayerVersionArn' \
-              --output text)
-            if [[ "$latest_arn" == "None" || -z "$latest_arn" ]]; then
-              echo "::error title=Layer resolution failed::Could not resolve layer '$layer'"
-              exit 1
-            fi
-            echo "✅ $layer → $latest_arn"
-            RESOLVED_LAYERS+=("$latest_arn")
+        IFS=',' read -ra LAYER_ARRAY <<< "${{ inputs.layers }}"
+        RESOLVED_LAYERS=""
+        for layer in "${LAYER_ARRAY[@]}"; do
+          layer=$(echo "$layer" | xargs) # trim whitespace
+          if [[ "$layer" != arn:aws:lambda:* ]]; then
+            # Resolve short name to full ARN
+            layer="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:layer:$layer"
           fi
+          RESOLVED_LAYERS="${RESOLVED_LAYERS}${layer},"
         done
+        echo "resolved_layers=${RESOLVED_LAYERS%,}" >> $GITHUB_ENV
 
         aws lambda update-function-configuration \
           --function-name "${{ inputs.function_name }}" \
           --layers "${RESOLVED_LAYERS[@]}"
         aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
+
+    - name: Validate secrets exist
+      if: ${{ inputs.configuration_secret || inputs.environment_secret }}
+      shell: bash
+      run: |
+        if [[ -n "${{ inputs.configuration_secret }}" ]]; then
+          if ! aws secretsmanager describe-secret --secret-id "${{ inputs.configuration_secret }}" >/dev/null 2>&1; then
+            echo "❌ Error: Configuration secret '${{ inputs.configuration_secret }}' not found"
+            exit 1
+          fi
+        fi
+        if [[ -n "${{ inputs.environment_secret }}" ]]; then
+          if ! aws secretsmanager describe-secret --secret-id "${{ inputs.environment_secret }}" >/dev/null 2>&1; then
+            echo "❌ Error: Environment secret '${{ inputs.environment_secret }}' not found"
+            exit 1
+          fi
+        fi
 
     - name: Load environment variables from secret
       if: inputs.environment_secret
