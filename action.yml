@@ -1,5 +1,5 @@
 name: 'Deploy to AWS Lambda'
-description: 'GitHub Action to update an AWS Lambda function using code from an artifact, S3, or container image, and apply configuration and environment variables from multiple sources.'
+description: 'GitHub Action to deploy AWS Lambda functions from artifacts, S3, or ECR with multi-source configuration support.'
 author: 'Rick Meneely <rick@devopspolis.com>'
 branding:
   icon: upload-cloud
