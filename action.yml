@@ -1,270 +1,960 @@
 name: 'Deploy to AWS Lambda'
-description: 'Deploys a zip file, artifact, or container image to AWS Lambda, with optional config, env, rollback, and layers support.'
+description: 'GitHub Action to update an AWS Lambda function using code from an artifact, S3, or container image, and apply configuration and environment variables from multiple sources.'
 author: 'Rick Meneely <rick@devopspolis.com>'
 branding:
-  icon: cloud-lightning
+  icon: upload-cloud
   color: purple
-  label: Deploy to Lambda
 
 inputs:
   function_name:
-    description: Lambda function name
+    description: Name of the Lambda function to deploy
     required: true
   version:
-    description: Deploy version (publishes a new version)
+    description: Optional version label (used for aliasing and VERSION env var)
     required: false
   aliases:
-    description: Comma-separated Lambda aliases to update after deployment
+    description: Comma-separated list of aliases to update
     required: false
-  environment_secret:
-    description: AWS Secret containing lambda environment variables as JSON
+  uri:
+    description: S3 URI (s3://...) or ECR URI (repo:tag) to deploy. If both uri and artifact are provided, uri takes precedence.
     required: false
-  configuration_secret:
-    description: AWS Secret containing lambda configuration as JSON
+  artifact:
+    description: GitHub artifact in the format artifact-name:zip-file-name
+    required: false
+  configuration:
+    description: Space-separated list of config sources (file::, secretsmanager::, ssm::)
+    required: false
+  environment_variables:
+    description: Space-separated list of env sources (file::, secretsmanager::, ssm::)
     required: false
   layers:
     description: Comma-separated list of Lambda layer ARNs or names
     required: false
-  uri:
-    description: AWS S3 URI (s3://bucket/key.zip) or ECR image URI (repository:tag) to deploy
-    required: false
-  artifact:
-    description: GitHub Actions artifact in the format "artifact_name:filename"
-    required: false
   role:
-    description: IAM role to assume (optional)
+    description: IAM role ARN or name to assume
     required: false
+  overwrite_layers:
+    description: If true, overwrites all existing layers. Otherwise, merges with existing.
+    required: false
+    default: false
+  aws_region:
+    description: AWS region for deployment
+    required: false
+    default: us-east-1
+  debug:
+    description: Enable debug mode for detailed logging and troubleshooting
+    required: false
+    default: false
+  dry_run:
+    description: Validate inputs and show what would be changed without applying changes
+    required: false
+    default: false
 
 outputs:
   function_name:
-    description: The Lambda function name
-    value: ${{ inputs.function_name }}
+    description: The deployed function name
+  function_arn:
+    description: The full ARN of the deployed function
   function_version:
-    description: The published function version or empty if $LATEST
-    value: ${{ steps.publish-version.outputs.function_version || steps.default-version.outputs.function_version }}
+    description: The published version or blank
+  function_size:
+    description: The size of the deployed code package in bytes
+  last_modified:
+    description: When the function was last modified (ISO 8601)
+  output_url:
+    description: The AWS Console URL of the Lambda function
+  deployment_source:
+    description: Source used for deployment (artifact, s3, ecr)
+  is_published:
+    description: true if version was published
+  aliases_updated:
+    description: Comma-separated list of aliases that were updated
 
 runs:
   using: composite
   steps:
-    - name: Resolve role ARN if short name
-      if: ${{ inputs.role }}
-      id: resolve-role
+    - name: Validate inputs and mask sensitive values
       shell: bash
       run: |
-        role="${{ inputs.role }}"
-        if [[ "$role" != arn:aws:iam::* ]]; then
-          echo "Resolving short role name to full ARN..."
-          # For OIDC, we need the AWS_ACCOUNT_ID to be available
-          if [[ -z "$AWS_ACCOUNT_ID" ]]; then
-            echo "❌ AWS_ACCOUNT_ID environment variable is required when using short role names"
-            exit 1
-          fi
-          role="arn:aws:iam::${AWS_ACCOUNT_ID}:role/$role"
+        if [[ -z "${{ inputs.function_name }}" ]]; then
+          echo "❌ function_name is required"
+          exit 1
         fi
-        echo "role_arn=$role" >> $GITHUB_OUTPUT
-        echo "✅ Using role: $role"
 
-    - name: Configure AWS credentials (if role specified)
-      if: ${{ inputs.role }}
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        role-to-assume: ${{ steps.resolve-role.outputs.role_arn }}
-        role-session-name: GitHubActionDeploySession
-        aws-region: ${{ inputs.bucket_region }}
+        if [[ -n "${{ inputs.version }}" ]]; then
+          echo "::add-mask::${{ inputs.version }}"
+        fi
 
-    - name: Validate inputs
-      shell: bash
-      run: |
         if [[ -z "${{ inputs.uri }}" && -z "${{ inputs.artifact }}" ]]; then
-          echo "❌ Error: Either 'uri' or 'artifact' input is required"
+          echo "❌ Either uri or artifact must be provided"
           exit 1
         fi
-        if [[ -n "${{ inputs.uri }}" && -n "${{ inputs.artifact }}" ]]; then
-          echo "⚠️ Warning: Both 'uri' and 'artifact' provided. Using 'uri' and ignoring 'artifact'"
-        fi
 
-    - name: Parse and validate artifact input
-      if: ${{ inputs.artifact && !inputs.uri }}
-      shell: bash
-      run: |
-        artifact="${{ inputs.artifact }}"
-        if [[ "$artifact" != *":"* ]]; then
-          echo "❌ Error: Artifact format must be 'artifact-name:filename.zip'"
+        if [[ -z "${{ inputs.aws_region }}" ]]; then
+          echo "❌ AWS region is not defined (via input or environment)"
           exit 1
         fi
-        artifact_name=$(echo "$artifact" | cut -d':' -f1)
-        filename=$(echo "$artifact" | cut -d':' -f2)
-        echo "artifact_name=$artifact_name" >> $GITHUB_ENV
-        echo "filename=$filename" >> $GITHUB_ENV
 
-    - name: Load Lambda configuration from secret
-      if: inputs.configuration_secret
-      id: load-config
-      shell: bash
-      run: |
-        CONFIG_JSON=$(aws secretsmanager get-secret-value \
-          --secret-id "${{ inputs.configuration_secret }}" \
-          --query SecretString --output text)
-
-        ROLE_NAME=$(echo "$CONFIG_JSON" | jq -r '.Role // empty')
-        if [[ -n "$ROLE_NAME" && "$ROLE_NAME" != arn:aws:iam::* ]]; then
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$ROLE_NAME"
-          CONFIG_JSON=$(echo "$CONFIG_JSON" | jq --arg role "$ROLE_ARN" '.Role = $role')
-        fi
-
-        echo "$CONFIG_JSON" > lambda_config.json
-
-    - name: Apply Lambda configuration
-      if: inputs.configuration_secret
-      shell: bash
-      run: |
-        aws lambda update-function-configuration \
-          --function-name "${{ inputs.function_name }}" \
-          --cli-input-json file://lambda_config.json
-        aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
-
-    - name: Resolve layer ARNs
-      if: ${{ inputs.layers }}
-      shell: bash
-      run: |
-        IFS=',' read -ra LAYER_ARRAY <<< "${{ inputs.layers }}"
-        RESOLVED_LAYERS=""
-        for layer in "${LAYER_ARRAY[@]}"; do
-          layer=$(echo "$layer" | xargs) # trim whitespace
-          if [[ "$layer" != arn:aws:lambda:* ]]; then
-            # Resolve short name to full ARN
-            layer="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:layer:$layer"
+        if [[ -n "${{ inputs.artifact }}" ]]; then
+          ARTIFACT_PARTS=("${{ inputs.artifact }}")
+          IFS=":" read -r art_name zip_name <<< "${{ inputs.artifact }}"
+          if [[ -z "$art_name" || -z "$zip_name" ]]; then
+            echo "❌ artifact must be in format artifact-name:zip-name"
+            exit 1
           fi
-          RESOLVED_LAYERS="${RESOLVED_LAYERS}${layer},"
+        fi
+
+    - name: Enhanced input validation and environment check
+      shell: bash
+      run: |
+        echo "🔍 Performing enhanced input validation..."
+        
+        # Check required tools
+        for tool in jq aws gh; do
+          if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "❌ Required tool '$tool' is not available"
+            exit 1
+          fi
         done
-        echo "resolved_layers=${RESOLVED_LAYERS%,}" >> $GITHUB_ENV
-
-        aws lambda update-function-configuration \
-          --function-name "${{ inputs.function_name }}" \
-          --layers "${RESOLVED_LAYERS[@]}"
-        aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
-
-    - name: Validate secrets exist
-      if: ${{ inputs.configuration_secret || inputs.environment_secret }}
-      shell: bash
-      run: |
-        if [[ -n "${{ inputs.configuration_secret }}" ]]; then
-          if ! aws secretsmanager describe-secret --secret-id "${{ inputs.configuration_secret }}" >/dev/null 2>&1; then
-            echo "❌ Error: Configuration secret '${{ inputs.configuration_secret }}' not found"
-            exit 1
-          fi
-        fi
-        if [[ -n "${{ inputs.environment_secret }}" ]]; then
-          if ! aws secretsmanager describe-secret --secret-id "${{ inputs.environment_secret }}" >/dev/null 2>&1; then
-            echo "❌ Error: Environment secret '${{ inputs.environment_secret }}' not found"
-            exit 1
-          fi
-        fi
-
-    - name: Load environment variables from secret
-      if: inputs.environment_secret
-      id: load-env
-      shell: bash
-      run: |
-        ENV_VARS_JSON=$(aws secretsmanager get-secret-value \
-          --secret-id "${{ inputs.environment_secret }}" \
-          --query SecretString --output text)
-
-        if echo "$ENV_VARS_JSON" | jq -e 'has("VERSION")' >/dev/null && [[ -n "${{ inputs.version }}" ]]; then
-          ENV_VARS_JSON=$(echo "$ENV_VARS_JSON" | jq --arg v "${{ inputs.version }}" '.VERSION = $v')
-        fi
-
-        echo "{\"Variables\": $ENV_VARS_JSON}" > lambda_env.json
-
-    - name: Apply environment variables
-      if: inputs.environment_secret
-      shell: bash
-      run: |
-        aws lambda update-function-configuration \
-          --function-name "${{ inputs.function_name }}" \
-          --environment file://lambda_env.json
-        aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
-
-    - name: Deploy from URI
-      if: inputs.uri
-      shell: bash
-      run: |
-        if [[ "${{ inputs.uri }}" == s3://* ]]; then
-          BUCKET=$(echo "${{ inputs.uri }}" | cut -d/ -f3)
-          KEY=$(echo "${{ inputs.uri }}" | cut -d/ -f4-)
-          aws lambda update-function-code \
-            --function-name "${{ inputs.function_name }}" \
-            --s3-bucket "$BUCKET" \
-            --s3-key "$KEY"
-        else
-          aws lambda update-function-code \
-            --function-name "${{ inputs.function_name }}" \
-            --image-uri "${{ inputs.uri }}"
-        fi
-        aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
-
-    - name: Download artifact
-      if: inputs.artifact && !inputs.uri
-      uses: actions/download-artifact@v4
-      with:
-        name: ${{ steps.parse-artifact.outputs.artifact_name }}
-        path: ./artifact-download
-
-    - name: Deploy from artifact
-      if: inputs.artifact && !inputs.uri
-      shell: bash
-      run: |
-        FILE_PATH="./artifact-download/${{ steps.parse-artifact.outputs.artifact_file }}"
-        if [[ ! -f "$FILE_PATH" ]]; then
-          echo "::error title=Artifact missing::Artifact file not found: $FILE_PATH"
-          exit 1
-        fi
-        aws lambda update-function-code \
-          --function-name "${{ inputs.function_name }}" \
-          --zip-file fileb://"$FILE_PATH"
-        aws lambda wait function-updated --function-name "${{ inputs.function_name }}"
-
-    - name: Default version fallback
-      id: default-version
-      if: ${{ !inputs.version }}
-      shell: bash
-      run: |
-        echo "function_version=\$LATEST" >> $GITHUB_ENV
-        echo "function_version=\$LATEST" >> $GITHUB_OUTPUT
-
-    - name: Publish new version
-      if: inputs.version
-      id: publish-version
-      shell: bash
-      run: |
-        response=$(aws lambda publish-version --function-name "${{ inputs.function_name }}")
-        function_version=$(echo "$response" | jq -r '.Version')
-        echo "Published function version: $function_version"
-        echo "function_version=$function_version" >> $GITHUB_ENV
-        echo "function_version=$function_version" >> $GITHUB_OUTPUT
-
-    - name: Update aliases
-      if: inputs.aliases
-      shell: bash
-      run: |
-        version="${{ steps.publish-version.outputs.function_version }}"
-        if [ -z "$version" ]; then
-          version="${{ steps.default-version.outputs.function_version }}"
-        fi
-
-        for alias in $(echo "${{ inputs.aliases }}" | tr ',' ' '); do
-          [[ -z "$alias" ]] && continue
-          exists=$(aws lambda list-aliases --function-name "${{ inputs.function_name }}" --query "Aliases[?Name=='${alias}'].Name" --output text)
-          if [[ -z "$exists" ]]; then
-            aws lambda create-alias \
-              --function-name "${{ inputs.function_name }}" \
-              --name "$alias" \
-              --function-version "$version"
+        
+        # Validate URI formats if provided
+        if [[ -n "${{ inputs.uri }}" ]]; then
+          uri="${{ inputs.uri }}"
+          if [[ "$uri" == s3://* ]]; then
+            # Validate S3 URI format
+            if [[ ! "$uri" =~ ^s3://[a-zA-Z0-9.\-_]+/.+ ]]; then
+              echo "❌ Invalid S3 URI format: $uri"
+              echo "💡 Expected format: s3://bucket-name/path/to/file.zip"
+              exit 1
+            fi
+          elif [[ "$uri" == *".dkr.ecr."*".amazonaws.com"* ]]; then
+            # Validate ECR URI format
+            if [[ ! "$uri" =~ ^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/.+:.+ ]]; then
+              echo "❌ Invalid ECR URI format: $uri"
+              echo "💡 Expected format: 123456789012.dkr.ecr.region.amazonaws.com/repo:tag"
+              exit 1
+            fi
           else
-            aws lambda update-alias \
-              --function-name "${{ inputs.function_name }}" \
-              --name "$alias" \
-              --function-version "$version"
+            echo "❌ URI must be either S3 (s3://...) or ECR format"
+            exit 1
+          fi
+        fi
+        
+        # Validate layer format if provided
+        if [[ -n "${{ inputs.layers }}" ]]; then
+          IFS=',' read -ra LAYERS <<< "${{ inputs.layers }}"
+          for layer in "${LAYERS[@]}"; do
+            layer=$(echo "$layer" | xargs) # trim whitespace
+            # Allow ARNs, names, or names with versions
+            if [[ ! "$layer" =~ ^(arn:aws:lambda:[^:]+:[^:]+:layer:[^:]+:[0-9]+|[a-zA-Z0-9_-]+(:([0-9]+|\$LATEST))?)$ ]]; then
+              echo "⚠️ Layer format may be invalid: $layer"
+              echo "💡 Expected: ARN, layer-name, layer-name:version, or layer-name:\$LATEST"
+            fi
+          done
+        fi
+        
+        # Check AWS CLI configuration
+        if ! aws sts get-caller-identity --region "${{ inputs.aws_region }}" >/dev/null 2>&1; then
+          echo "❌ AWS CLI not configured or invalid credentials"
+          echo "💡 Ensure AWS credentials are properly configured"
+          exit 1
+        fi
+        
+        echo "✅ Input validation completed successfully"
+
+    - name: Setup helper functions
+      shell: bash
+      run: |
+        # Create helper functions for file format detection, retry logic, and error handling
+        cat > /tmp/format_helpers.sh << 'EOF'
+        #!/bin/bash
+        
+        # Global variables for error context
+        CURRENT_FUNCTION_NAME="${{ inputs.function_name }}"
+        CURRENT_REGION="${{ inputs.aws_region }}"
+        DEBUG_MODE="${{ inputs.debug }}"
+        DRY_RUN_MODE="${{ inputs.dry_run }}"
+
+        # Retry function for AWS operations
+        retry_aws_command() {
+          local max_attempts=3
+          local attempt=1
+          local cmd=("$@")
+          
+          while [ $attempt -le $max_attempts ]; do
+            if [[ "$DEBUG_MODE" == "true" ]]; then
+              echo "🔍 [DEBUG] Attempting: ${cmd[*]} (attempt $attempt/$max_attempts)"
+            fi
+            
+            if "${cmd[@]}"; then
+              if [[ "$DEBUG_MODE" == "true" ]]; then
+                echo "✅ [DEBUG] Command succeeded on attempt $attempt"
+              fi
+              return 0
+            fi
+            
+            local exit_code=$?
+            echo "⚠️ Attempt $attempt/$max_attempts failed for function '$CURRENT_FUNCTION_NAME' in region '$CURRENT_REGION'"
+            
+            if [ $attempt -lt $max_attempts ]; then
+              local delay=$((attempt * 2))
+              echo "🔄 Retrying in ${delay} seconds..."
+              sleep $delay
+            fi
+            ((attempt++))
+          done
+          
+          echo "❌ All retry attempts failed for: ${cmd[*]}"
+          echo "Function: $CURRENT_FUNCTION_NAME, Region: $CURRENT_REGION"
+          return $exit_code
+        }
+
+        # Enhanced error reporting
+        report_error() {
+          local context="$1"
+          local error_msg="$2"
+          echo "❌ Error in $context"
+          echo "Function: $CURRENT_FUNCTION_NAME"
+          echo "Region: $CURRENT_REGION"
+          echo "Details: $error_msg"
+        }
+
+        # Debug logging function
+        debug_log() {
+          if [[ "$DEBUG_MODE" == "true" ]]; then
+            echo "🔍 [DEBUG] $*"
+          fi
+        }
+
+        # Dry run wrapper
+        dry_run_command() {
+          local description="$1"
+          shift
+          local cmd=("$@")
+          
+          if [[ "$DRY_RUN_MODE" == "true" ]]; then
+            echo "🔍 [DRY RUN] Would execute: $description"
+            echo "   Command: ${cmd[*]}"
+            return 0
+          else
+            "${cmd[@]}"
+          fi
+        }
+
+        # Detect file format (json or dotenv)
+        detect_file_format() {
+          local file="$1"
+          if [[ ! -f "$file" ]]; then
+            echo "unknown"
+            return
+          fi
+
+          # Try to parse as JSON first
+          if jq empty "$file" 2>/dev/null; then
+            echo "json"
+          else
+            # Check if it looks like dotenv format
+            if grep -q "^[A-Za-z_][A-Za-z0-9_]*=" "$file" 2>/dev/null; then
+              echo "dotenv"
+            else
+              echo "unknown"
+            fi
+          fi
+        }
+
+        # Convert dotenv to JSON with proper escaping
+        # SECURITY: Uses jq to safely process values without shell interpretation
+        dotenv_to_json() {
+          local file="$1"
+          local output_file="$2"
+
+          # Use jq to safely build JSON to avoid shell interpretation
+          local temp_pairs="/tmp/dotenv_pairs_$$.txt"
+          > "$temp_pairs"  # Clear temp file
+
+          # Extract key-value pairs safely
+          while IFS= read -r line; do
+            # Skip empty lines and comments
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+            # Parse KEY=VALUE format
+            if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+              local key="${BASH_REMATCH[1]}"
+              local value="${BASH_REMATCH[2]}"
+
+              # Remove surrounding quotes if present
+              if [[ "$value" =~ ^[\"\'](.*)[\"\']$ ]]; then
+                value="${BASH_REMATCH[1]}"
+              fi
+
+              # Write key and value to separate lines for safe jq processing
+              echo "$key" >> "${temp_pairs}.keys"
+              echo "$value" >> "${temp_pairs}.values"
+            fi
+          done < "$file"
+
+          # Use jq to safely build JSON from key-value pairs
+          if [[ -f "${temp_pairs}.keys" && -f "${temp_pairs}.values" ]]; then
+            paste "${temp_pairs}.keys" "${temp_pairs}.values" | \
+            jq -R 'split("\t") | {key: .[0], value: .[1]}' | \
+            jq -s 'reduce .[] as $item ({}; .[$item.key] = $item.value)' > "$output_file"
+          else
+            echo "{}" > "$output_file"
+          fi
+
+          # Cleanup temp files
+          rm -f "${temp_pairs}" "${temp_pairs}.keys" "${temp_pairs}.values"
+        }
+
+        # Convert AWS Parameter Store parameter to JSON based on type
+        # SECURITY: Uses jq for all value processing to prevent shell interpretation
+        convert_parameter_to_json() {
+          local param_name="$1"
+          local param_type="$2"
+          local param_value_file="$3"  # Changed: now expects a file containing the value
+          local output_file="$4"
+
+          case "$param_type" in
+            "String"|"SecureString")
+              # Try to parse as JSON first using jq for safety
+              if jq empty "$param_value_file" 2>/dev/null; then
+                # It's valid JSON, copy it directly
+                cp "$param_value_file" "$output_file"
+              else
+                # Treat as simple string value, use parameter name as key
+                local key=$(basename "$param_name")
+                # Use jq to safely encode both key and value from file
+                jq -n --arg key "$key" --rawfile value "$param_value_file" '{($key): $value}' > "$output_file"
+              fi
+              ;;
+            "StringList")
+              # Convert comma-separated values to JSON array
+              local key=$(basename "$param_name")
+              # Use jq to safely handle the comma-separated values from file
+              jq -R 'split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))' "$param_value_file" | \
+                jq --arg key "$key" '{($key): .}' > "$output_file"
+              ;;
+            *)
+              echo "❌ Unknown parameter type: $param_type"
+              exit 1
+              ;;
+          esac
+        }
+
+        # Merge JSON files
+        merge_json_files() {
+          local output_file="$1"
+          shift
+          local files=("$@")
+
+          echo "{}" > "$output_file"
+
+          for file in "${files[@]}"; do
+            if [[ -f "$file" ]]; then
+              local temp_merged="/tmp/temp_merged_$$.json"
+              jq -s '.[0] * .[1]' "$output_file" "$file" > "$temp_merged"
+              mv "$temp_merged" "$output_file"
+            fi
+          done
+        }
+        EOF
+
+        chmod +x /tmp/format_helpers.sh
+        source /tmp/format_helpers.sh
+      shell: bash
+      run: |
+        source /tmp/format_helpers.sh
+
+        if [[ -n "${{ inputs.configuration }}" ]]; then
+          echo "🔧 Processing configuration sources..."
+          debug_log "Configuration sources: ${{ inputs.configuration }}"
+
+          CONFIG_FILES=()
+          config_counter=0
+          config_sources=(${{ inputs.configuration }})
+          
+          debug_log "Found ${#config_sources[@]} configuration source(s)"
+
+          for source in ${{ inputs.configuration }}; do
+            config_counter=$((config_counter + 1))
+            temp_config_file="/tmp/config_${config_counter}.json"
+            debug_log "Processing configuration source $config_counter: $source"
+
+            if [[ "$source" == file::* ]]; then
+              # File source
+              file_path="${source#file::}"
+              echo "📄 Processing config file: $file_path"
+
+              format=$(detect_file_format "$file_path")
+              case "$format" in
+                "json")
+                  cp "$file_path" "$temp_config_file"
+                  ;;
+                "dotenv")
+                  echo "🔄 Converting dotenv to JSON: $file_path"
+                  dotenv_to_json "$file_path" "$temp_config_file"
+                  ;;
+                *)
+                  echo "❌ Unknown file format for: $file_path"
+                  exit 1
+                  ;;
+              esac
+
+            elif [[ "$source" == secretsmanager::* ]]; then
+              # Secrets Manager source
+              secret_name="${source#secretsmanager::}"
+              echo "🔐 Processing Secrets Manager: $secret_name"
+              debug_log "Retrieving secret: $secret_name in region ${{ inputs.aws_region }}"
+
+              # Use retry logic for AWS CLI operations
+              if ! retry_aws_command aws secretsmanager get-secret-value \
+                --secret-id "$secret_name" \
+                --region "${{ inputs.aws_region }}" \
+                --query 'SecretString' \
+                --output text > "$temp_config_file"; then
+                report_error "Secrets Manager retrieval" "Failed to retrieve secret: $secret_name"
+                exit 1
+              fi
+
+              # Validate that the output is valid JSON
+              if ! jq empty "$temp_config_file" 2>/dev/null; then
+                report_error "Secrets Manager validation" "Invalid JSON from secret: $secret_name"
+                exit 1
+              fi
+              
+              debug_log "Successfully retrieved and validated secret: $secret_name"
+
+            elif [[ "$source" == ssm::* ]]; then
+              # Parameter Store source
+              param_name="${source#ssm::}"
+              echo "📋 Processing Parameter Store: $param_name"
+              debug_log "Retrieving parameter: $param_name in region ${{ inputs.aws_region }}"
+
+              # Get parameter with metadata using AWS CLI JSON output with retry
+              # SECURITY: Store value in file to prevent shell interpretation
+              if ! retry_aws_command aws ssm get-parameter \
+                --name "$param_name" \
+                --region "${{ inputs.aws_region }}" \
+                --with-decryption \
+                --output json > "/tmp/param_info_$.json"; then
+                report_error "Parameter Store retrieval" "Failed to retrieve parameter: $param_name"
+                exit 1
+              fi
+
+              param_type=$(jq -r '.Parameter.Type' "/tmp/param_info_$.json")
+              # Extract parameter value directly to file to avoid shell interpretation
+              jq -r '.Parameter.Value' "/tmp/param_info_$.json" > "/tmp/param_value_$.txt"
+              
+              debug_log "Parameter type: $param_type"
+
+              convert_parameter_to_json "$param_name" "$param_type" "/tmp/param_value_$.txt" "$temp_config_file"
+
+              rm -f "/tmp/param_info_$.json" "/tmp/param_value_$.txt"
+              debug_log "Successfully processed parameter: $param_name"
+
+            else
+              # Legacy format - assume Secrets Manager
+              echo "🔐 Processing Secrets Manager (legacy): $source"
+
+              # Use AWS CLI to get secret value and write directly to file
+              aws secretsmanager get-secret-value \
+                --secret-id "$source" \
+                --region "${{ inputs.aws_region }}" \
+                --query 'SecretString' \
+                --output text > "$temp_config_file"
+
+              # Validate that the output is valid JSON
+              if ! jq empty "$temp_config_file" 2>/dev/null; then
+                echo "❌ Invalid JSON from Secrets Manager: $source"
+                exit 1
+              fi
+            fi
+
+            CONFIG_FILES+=("$temp_config_file")
+          done
+
+          # Merge all configuration files
+          if [[ ${#CONFIG_FILES[@]} -gt 0 ]]; then
+            echo "🔀 Merging configuration files..."
+            merge_json_files "/tmp/final_config.json" "${CONFIG_FILES[@]}"
+            echo "✅ Configuration processing complete"
+          fi
+        fi
+
+    - name: Process environment variable sources
+      shell: bash
+      run: |
+        source /tmp/format_helpers.sh
+
+        if [[ -n "${{ inputs.environment_variables }}" ]]; then
+          echo "🌍 Processing environment variable sources..."
+
+          ENV_FILES=()
+          env_counter=0
+
+          for source in ${{ inputs.environment_variables }}; do
+            env_counter=$((env_counter + 1))
+            temp_env_file="/tmp/env_${env_counter}.json"
+
+            if [[ "$source" == file::* ]]; then
+              # File source
+              file_path="${source#file::}"
+              echo "📄 Processing env file: $file_path"
+
+              format=$(detect_file_format "$file_path")
+              case "$format" in
+                "json")
+                  cp "$file_path" "$temp_env_file"
+                  ;;
+                "dotenv")
+                  echo "🔄 Converting dotenv to JSON: $file_path"
+                  dotenv_to_json "$file_path" "$temp_env_file"
+                  ;;
+                *)
+                  echo "❌ Unknown file format for: $file_path"
+                  exit 1
+                  ;;
+              esac
+
+            elif [[ "$source" == secretsmanager::* ]]; then
+              # Secrets Manager source
+              secret_name="${source#secretsmanager::}"
+              echo "🔐 Processing Secrets Manager: $secret_name"
+
+              # Use AWS CLI to get secret value and write directly to file
+              # This avoids shell interpretation of special characters
+              aws secretsmanager get-secret-value \
+                --secret-id "$secret_name" \
+                --region "${{ inputs.aws_region }}" \
+                --query 'SecretString' \
+                --output text > "$temp_env_file"
+
+              # Validate that the output is valid JSON
+              if ! jq empty "$temp_env_file" 2>/dev/null; then
+                echo "❌ Invalid JSON from Secrets Manager: $secret_name"
+                exit 1
+              fi
+
+            elif [[ "$source" == ssm::* ]]; then
+              # Parameter Store source
+              param_name="${source#ssm::}"
+              echo "📋 Processing Parameter Store: $param_name"
+
+              # Get parameter with metadata using AWS CLI JSON output
+              # SECURITY: Store value in file to prevent shell interpretation
+              if ! retry_aws_command aws ssm get-parameter \
+                --name "$param_name" \
+                --region "${{ inputs.aws_region }}" \
+                --with-decryption \
+                --output json > "/tmp/param_info_env_$.json"; then
+                report_error "Parameter Store retrieval" "Failed to retrieve parameter: $param_name"
+                exit 1
+              fi
+
+              param_type=$(jq -r '.Parameter.Type' "/tmp/param_info_env_$.json")
+              # Extract parameter value directly to file to avoid shell interpretation
+              jq -r '.Parameter.Value' "/tmp/param_info_env_$.json" > "/tmp/param_value_env_$.txt"
+              
+              debug_log "Parameter type: $param_type"
+
+              convert_parameter_to_json "$param_name" "$param_type" "/tmp/param_value_env_$.txt" "$temp_env_file"
+
+              rm -f "/tmp/param_info_env_$.json" "/tmp/param_value_env_$.txt"
+
+            else
+              # Legacy format - assume Secrets Manager
+              echo "🔐 Processing Secrets Manager (legacy): $source"
+
+              # Use AWS CLI to get secret value and write directly to file
+              aws secretsmanager get-secret-value \
+                --secret-id "$source" \
+                --region "${{ inputs.aws_region }}" \
+                --query 'SecretString' \
+                --output text > "$temp_env_file"
+
+              # Validate that the output is valid JSON
+              if ! jq empty "$temp_env_file" 2>/dev/null; then
+                echo "❌ Invalid JSON from Secrets Manager: $source"
+                exit 1
+              fi
+            fi
+
+            ENV_FILES+=("$temp_env_file")
+          done
+
+          # Merge all environment files
+          if [[ ${#ENV_FILES[@]} -gt 0 ]]; then
+            echo "🔀 Merging environment variable files..."
+            merge_json_files "/tmp/final_env.json" "${ENV_FILES[@]}"
+
+            # Set VERSION environment variable if version input is provided
+            if [[ -n "${{ inputs.version }}" ]]; then
+              echo "🏷️ Setting VERSION environment variable to: ${{ inputs.version }}"
+              temp_version_file="/tmp/version_env.json"
+              # Use jq to safely encode the version value
+              jq -n --arg version "${{ inputs.version }}" '{"VERSION": $version}' > "$temp_version_file"
+              merge_json_files "/tmp/final_env.json" "/tmp/final_env.json" "$temp_version_file"
+            fi
+
+            echo "✅ Environment variables processing complete"
+          fi
+        fi
+
+    - name: Log deployment source
+      shell: bash
+      run: |
+        if [[ -n "${{ inputs.uri }}" ]]; then
+          echo "deployment_source=s3_or_ecr" >> $GITHUB_OUTPUT
+        else
+          echo "deployment_source=artifact" >> $GITHUB_OUTPUT
+        fi
+        echo "🔖 Version label (semantic only): ${{ inputs.version }}"
+
+    - name: Optional masking of secrets (env/config values)
+      shell: bash
+      run: |
+        command -v jq >/dev/null || { echo "❌ jq is required for processing JSON"; exit 1; }
+
+        mask_keys() {
+          local json_file="$1"
+          if [[ -f "$json_file" ]]; then
+            jq -r 'to_entries[] | .value' "$json_file" | while read -r val; do
+              echo "::add-mask::$val"
+            done
+          fi
+        }
+
+        # Mask values from all processed files
+        for file in /tmp/env*.json /tmp/config*.json /tmp/final_*.json; do
+          if [[ -f "$file" ]]; then
+            mask_keys "$file"
           fi
         done
+
+    - name: Deploy Lambda function code
+      shell: bash
+      run: |
+        echo "🚀 Deploying Lambda function code..."
+
+        if [[ -n "${{ inputs.uri }}" ]]; then
+          if [[ "${{ inputs.uri }}" == s3://* ]]; then
+            # S3 deployment
+            echo "📦 Deploying from S3: ${{ inputs.uri }}"
+            aws lambda update-function-code \
+              --function-name "${{ inputs.function_name }}" \
+              --s3-bucket "$(echo "${{ inputs.uri }}" | sed 's|s3://||' | cut -d'/' -f1)" \
+              --s3-key "$(echo "${{ inputs.uri }}" | sed 's|s3://[^/]*/||')" \
+              --region "${{ inputs.aws_region }}"
+          else
+            # ECR deployment
+            echo "🐳 Deploying from ECR: ${{ inputs.uri }}"
+            aws lambda update-function-code \
+              --function-name "${{ inputs.function_name }}" \
+              --image-uri "${{ inputs.uri }}" \
+              --region "${{ inputs.aws_region }}"
+          fi
+        else
+          # Artifact deployment
+          echo "📋 Deploying from artifact: ${{ inputs.artifact }}"
+          IFS=":" read -r art_name zip_name <<< "${{ inputs.artifact }}"
+
+          # Download and extract artifact
+          gh run download --name "$art_name" --dir /tmp/
+
+          aws lambda update-function-code \
+            --function-name "${{ inputs.function_name }}" \
+            --zip-file "fileb:///tmp/$zip_name" \
+            --region "${{ inputs.aws_region }}"
+        fi
+
+    - name: Update Lambda configuration
+      shell: bash
+      run: |
+        source /tmp/format_helpers.sh
+        
+        if [[ -f "/tmp/final_config.json" ]]; then
+          echo "⚙️ Updating Lambda configuration..."
+          debug_log "Processing configuration keys dynamically"
+
+          # Use jq to safely extract and pass configuration values
+          # This prevents shell interpretation of special characters
+          args=("--function-name" "${{ inputs.function_name }}" "--region" "${{ inputs.aws_region }}")
+
+          # Get all keys from the configuration JSON
+          config_keys=$(jq -r 'keys[]' /tmp/final_config.json)
+          
+          # Process each configuration key dynamically
+          while IFS= read -r key; do
+            [[ -z "$key" ]] && continue
+            
+            debug_log "Processing config key: $key"
+            
+            # Convert key to AWS CLI parameter format (kebab-case)
+            aws_param=$(echo "$key" | sed 's/\([A-Z]\)/-\L\1/g' | sed 's/^-//')
+            debug_log "AWS parameter: --$aws_param"
+            
+            # Handle special cases that need different processing
+            case "$key" in
+              "VpcConfig")
+                # VPC config needs to be passed as a file to handle complex JSON safely
+                jq -c ".$key" /tmp/final_config.json > "/tmp/vpc_config_$$.json"
+                args+=("--$aws_param" "file:///tmp/vpc_config_$$.json")
+                debug_log "Added VPC config via file"
+                ;;
+              "Environment")
+                # Environment should not be processed here - it's handled in a separate step
+                debug_log "Skipping Environment key (handled separately)"
+                continue
+                ;;
+              "Layers")
+                # Layers should not be processed here - they're handled in a separate step
+                debug_log "Skipping Layers key (handled separately)"
+                continue
+                ;;
+              *)
+                # For all other parameters, extract the value safely
+                value=$(jq -r ".$key" /tmp/final_config.json)
+                if [[ "$value" != "null" ]]; then
+                  args+=("--$aws_param" "$value")
+                  debug_log "Added --$aws_param with value"
+                fi
+                ;;
+            esac
+          done <<< "$config_keys"
+
+          if [[ "$DRY_RUN_MODE" == "true" ]]; then
+            echo "🔍 [DRY RUN] Would update configuration with:"
+            printf '   %s\n' "${args[@]}"
+          else
+            # Execute the command with proper argument handling and retry logic
+            if ! retry_aws_command aws lambda update-function-configuration "${args[@]}"; then
+              report_error "Lambda configuration update" "Failed to update function configuration"
+              exit 1
+            fi
+            
+            echo "✅ Lambda configuration updated"
+          fi
+
+          # Clean up temp VPC config file
+          rm -f "/tmp/vpc_config_$$.json"
+        fi
+
+    - name: Update Lambda environment variables
+      shell: bash
+      run: |
+        if [[ -f "/tmp/final_env.json" ]]; then
+          echo "🌍 Updating Lambda environment variables..."
+
+          # Use jq to safely transform JSON to AWS CLI format
+          # This prevents shell interpretation of special characters in values
+          jq -c '{Variables: .}' /tmp/final_env.json > /tmp/env_for_aws.json
+
+          aws lambda update-function-configuration \
+            --function-name "${{ inputs.function_name }}" \
+            --environment file:///tmp/env_for_aws.json \
+            --region "${{ inputs.aws_region }}"
+
+          rm -f /tmp/env_for_aws.json
+
+          echo "✅ Lambda environment variables updated"
+        fi
+
+    - name: Update Lambda layers
+      shell: bash
+      run: |
+        source /tmp/format_helpers.sh
+        
+        if [[ -n "${{ inputs.layers }}" ]]; then
+          echo "📚 Updating Lambda layers..."
+          debug_log "Input layers: ${{ inputs.layers }}"
+          
+          # Process and resolve layer ARNs with version support
+          RESOLVED_LAYERS=()
+          IFS=',' read -ra LAYER_LIST <<< "${{ inputs.layers }}"
+          
+          for layer in "${LAYER_LIST[@]}"; do
+            layer=$(echo "$layer" | xargs) # trim whitespace
+            debug_log "Processing layer: $layer"
+            
+            if [[ "$layer" =~ ^arn:aws:lambda: ]]; then
+              # Already a full ARN
+              RESOLVED_LAYERS+=("$layer")
+              debug_log "Using full ARN: $layer"
+            elif [[ "$layer" =~ ^[a-zA-Z0-9_-]+:([0-9]+|\$LATEST)$ ]]; then
+              # Layer name with version (e.g., my-layer:5 or my-layer:$LATEST)
+              layer_name="${layer%:*}"
+              layer_version="${layer#*:}"
+              debug_log "Layer name: $layer_name, version: $layer_version"
+              
+              # Get account ID for ARN construction
+              account_id=$(aws sts get-caller-identity --query 'Account' --output text --region "${{ inputs.aws_region }}")
+              resolved_arn="arn:aws:lambda:${{ inputs.aws_region }}:${account_id}:layer:${layer_name}:${layer_version}"
+              RESOLVED_LAYERS+=("$resolved_arn")
+              debug_log "Resolved to ARN: $resolved_arn"
+            else
+              # Just layer name, use $LATEST
+              debug_log "Layer name only: $layer, using \$LATEST version"
+              account_id=$(aws sts get-caller-identity --query 'Account' --output text --region "${{ inputs.aws_region }}")
+              resolved_arn="arn:aws:lambda:${{ inputs.aws_region }}:${account_id}:layer:${layer}:\$LATEST"
+              RESOLVED_LAYERS+=("$resolved_arn")
+              debug_log "Resolved to ARN: $resolved_arn"
+            fi
+          done
+
+          if [[ "${{ inputs.overwrite_layers }}" == "true" ]]; then
+            FINAL_LAYERS=("${RESOLVED_LAYERS[@]}")
+            debug_log "Overwriting existing layers with ${#FINAL_LAYERS[@]} new layers"
+          else
+            # Get existing layers and merge
+            if [[ "$DRY_RUN_MODE" != "true" ]]; then
+              EXISTING_LAYERS=( $(retry_aws_command aws lambda get-function-configuration \
+                --function-name "${{ inputs.function_name }}" \
+                --region "${{ inputs.aws_region }}" \
+                | jq -r '.Layers[].Arn') )
+            else
+              EXISTING_LAYERS=()
+            fi
+            FINAL_LAYERS=( "${EXISTING_LAYERS[@]}" "${RESOLVED_LAYERS[@]}" )
+            debug_log "Merging ${#EXISTING_LAYERS[@]} existing + ${#RESOLVED_LAYERS[@]} new = ${#FINAL_LAYERS[@]} total layers"
+          fi
+
+          if [[ "$DRY_RUN_MODE" == "true" ]]; then
+            echo "🔍 [DRY RUN] Would update layers:"
+            for layer in "${FINAL_LAYERS[@]}"; do
+              echo "   - $layer"
+            done
+          else
+            if ! retry_aws_command aws lambda update-function-configuration \
+              --function-name "${{ inputs.function_name }}" \
+              --layers "${FINAL_LAYERS[@]}" \
+              --region "${{ inputs.aws_region }}"; then
+              report_error "Layer update" "Failed to update layers"
+              exit 1
+            fi
+            
+            echo "✅ Lambda layers updated (${#FINAL_LAYERS[@]} total layers)"
+          fi
+        fi
+
+    - name: Publish version and update aliases
+      shell: bash
+      run: |
+        if [[ -n "${{ inputs.version }}" ]]; then
+          echo "📋 Publishing version: ${{ inputs.version }}"
+
+          version_arn=$(aws lambda publish-version \
+            --function-name "${{ inputs.function_name }}" \
+            --description "Version ${{ inputs.version }}" \
+            --region "${{ inputs.aws_region }}" \
+            --query 'Version' \
+            --output text)
+
+          echo "✅ Published version: $version_arn"
+
+          if [[ -n "${{ inputs.aliases }}" ]]; then
+            echo "🏷️ Updating aliases..."
+
+            IFS=',' read -ra ALIASES <<< "${{ inputs.aliases }}"
+            for alias in "${ALIASES[@]}"; do
+              alias=$(echo "$alias" | xargs) # trim whitespace
+              echo "Updating alias: $alias"
+
+              # Try to update alias, create if it doesn't exist
+              if ! aws lambda update-alias \
+                --function-name "${{ inputs.function_name }}" \
+                --name "$alias" \
+                --function-version "$version_arn" \
+                --region "${{ inputs.aws_region }}" 2>/dev/null; then
+
+                echo "Creating new alias: $alias"
+                aws lambda create-alias \
+                  --function-name "${{ inputs.function_name }}" \
+                  --name "$alias" \
+                  --function-version "$version_arn" \
+                  --region "${{ inputs.aws_region }}"
+              fi
+            done
+
+            echo "✅ Aliases updated"
+          fi
+        fi
+
+    - name: Set final deployment metadata
+      shell: bash
+      run: |
+        source /tmp/format_helpers.sh
+        
+        debug_log "Collecting final deployment metadata..."
+        
+        # Get function information for enhanced outputs
+        if [[ "$DRY_RUN_MODE" != "true" ]]; then
+          function_info=$(retry_aws_command aws lambda get-function \
+            --function-name "${{ inputs.function_name }}" \
+            --region "${{ inputs.aws_region }}" \
+            --output json)
+          
+          if [[ $? -eq 0 ]]; then
+            function_arn=$(echo "$function_info" | jq -r '.Configuration.FunctionArn')
+            function_size=$(echo "$function_info" | jq -r '.Configuration.CodeSize')
+            last_modified=$(echo "$function_info" | jq -r '.Configuration.LastModified')
+            
+            debug_log "Function ARN: $function_arn"
+            debug_log "Function size: $function_size bytes"
+            debug_log "Last modified: $last_modified"
+          else
+            debug_log "Could not retrieve function information for enhanced outputs"
+            function_arn="unknown"
+            function_size="unknown"
+            last_modified="unknown"
+          fi
+        else
+          function_arn="[DRY RUN]"
+          function_size="[DRY RUN]"
+          last_modified="[DRY RUN]"
+        fi
+        
+        # Prepare aliases list
+        aliases_updated=""
+        if [[ -n "${{ inputs.aliases }}" && -n "${{ inputs.version }}" ]]; then
+          aliases_updated="${{ inputs.aliases }}"
+        fi
+        
+        # Set all outputs
+        FUNC_URL="https://${{ inputs.aws_region }}.console.aws.amazon.com/lambda/home?region=${{ inputs.aws_region }}#/functions/${{ inputs.function_name }}"
+        echo "output_url=$FUNC_URL" >> $GITHUB_OUTPUT
+        echo "function_name=${{ inputs.function_name }}" >> $GITHUB_OUTPUT
+        echo "function_arn=$function_arn" >> $GITHUB_OUTPUT
+        echo "function_version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+        echo "function_size=$function_size" >> $GITHUB_OUTPUT
+        echo "last_modified=$last_modified" >> $GITHUB_OUTPUT
+        echo "is_published=$([[ -n \"${{ inputs.version }}\" ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+        echo "aliases_updated=$aliases_updated" >> $GITHUB_OUTPUT
+        
+        # Add final summary to GitHub Step Summary
+        echo "## 🎉 Deployment Complete" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Function**: ${{ inputs.function_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Region**: ${{ inputs.aws_region }}" >> $GITHUB_STEP_SUMMARY
+        if [[ "$DRY_RUN_MODE" != "true" ]]; then
+          echo "- **ARN**: $function_arn" >> $GITHUB_STEP_SUMMARY
+          echo "- **Size**: $function_size bytes" >> $GITHUB_STEP_SUMMARY
+          if [[ -n "${{ inputs.version }}" ]]; then
+            echo "- **Version**: ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [[ -n "$aliases_updated" ]]; then
+            echo "- **Aliases Updated**: $aliases_updated" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "- **Status**: Dry run completed successfully" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "[View in AWS Console]($FUNC_URL)" >> $GITHUB_STEP_SUMMARY
+
+    - name: Cleanup temp files
+      shell: bash
+      run: |
+        TEMP_FILES=(/tmp/config*.json /tmp/env*.json /tmp/final_*.json /tmp/artifact.zip /tmp/format_helpers.sh /tmp/temp_merged_*.json /tmp/param_info*.json /tmp/dotenv_pairs*.* /tmp/param_value*.txt /tmp/vpc_config.json /tmp/env_for_aws.json /tmp/version_env.json)
+        for f in "${TEMP_FILES[@]}"; do
+          [[ -f "$f" ]] && rm -f "$f"
+        done
+        echo "🧹 Cleanup complete"

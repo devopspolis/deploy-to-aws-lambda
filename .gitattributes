@@ -1,0 +1,10 @@
+# Exclude development and CI files from GitHub releases
+.github/ export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore
+*.code-workspace export-ignore
+CLAUDE.md export-ignore
+
+# Exclude test files if any exist
+**/test*/ export-ignore
+**/*test* export-ignore
